@@ -142,6 +142,44 @@ bool ggml_et_launch_kernel(ggml_backend_et_device_context* dev_ctx, const std::s
         // Wait for completion (synchronous execution)
         runtime->waitForStream(dev_ctx->default_stream);
 
+        // Check for kernel execution errors
+        auto errors = runtime->retrieveStreamErrors(dev_ctx->default_stream);
+        for (const auto& error : errors) {
+            // Check if there are error contexts (indicates kernel-level errors)
+            if (error.errorContext_.has_value() && !error.errorContext_->empty()) {
+                bool found_kernel_error = false;
+
+                for (const auto& ctx : *error.errorContext_) {
+                    // Type 4 = CM_CONTEXT_TYPE_USER_KERNEL_ERROR (kernel returned non-zero)
+                    // Skip uninitialized contexts (debug fill pattern 0xcdcdcdcdcdcdcdcd)
+                    if (ctx.type_ == 4 && ctx.hartId_ != 0xcdcdcdcdcdcdcdcdULL) {
+                        int64_t kernel_return_code = ctx.userDefinedError_;
+                        GGML_LOG_ERROR("ET: Kernel '%s' returned error code %lld on hart %lld (shire %lld)\n",
+                                     kernel_name.c_str(),
+                                     (long long)kernel_return_code,
+                                     (long long)ctx.hartId_,
+                                     (long long)(ctx.hartId_ / 64));
+                        found_kernel_error = true;
+
+                        // Only log first failing hart to avoid spam
+                        break;
+                    }
+                }
+
+                if (found_kernel_error) {
+                    return false;
+                }
+            }
+
+            // Handle errors without contexts (other device-level errors)
+            if (error.errorCode_ != rt::DeviceErrorCode::Unknown) {
+                GGML_LOG_ERROR("ET: Kernel '%s' failed with device error code %d\n",
+                             kernel_name.c_str(),
+                             (int)error.errorCode_);
+                return false;
+            }
+        }
+
         GGML_LOG_DEBUG("ET: Kernel %s completed successfully\n", kernel_name.c_str());
         return true;
 
