@@ -35,6 +35,9 @@ static bool ggml_et_driver_init() {
 	try {
 	    _drv.device_layer = dev::IDeviceLayer::createPcieDeviceLayer();
 	    _drv.runtime = rt::IRuntime::create(_drv.device_layer);
+	    _drv.runtime->setOnStreamErrorsCallback([](auto, const auto& error) {
+						     throw std::runtime_error(error.getString());
+						   });
 	    GGML_LOG_INFO("ET: FOUND %d devices!\n", _drv.device_layer->getDevicesCount());
 
 	    // Initialize profiler if requested via environment variable
