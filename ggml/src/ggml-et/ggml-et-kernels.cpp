@@ -154,9 +154,10 @@ bool ggml_et_launch_kernel(ggml_backend_et_device_context* dev_ctx, const std::s
                     // Skip uninitialized contexts (debug fill pattern 0xcdcdcdcdcdcdcdcd)
                     if (ctx.type_ == 4 && ctx.hartId_ != 0xcdcdcdcdcdcdcdcdULL) {
                         int64_t kernel_return_code = ctx.userDefinedError_;
-                        GGML_LOG_ERROR("ET: Kernel '%s' returned error code %lld on hart %lld (shire %lld)\n",
+                        GGML_LOG_ERROR("ET: Kernel '%s' returned error code %lld on device %d, hart %lld (shire %lld)\n",
                                      kernel_name.c_str(),
                                      (long long)kernel_return_code,
+                                     dev_ctx->devidx,
                                      (long long)ctx.hartId_,
                                      (long long)(ctx.hartId_ / 64));
                         found_kernel_error = true;
@@ -173,9 +174,10 @@ bool ggml_et_launch_kernel(ggml_backend_et_device_context* dev_ctx, const std::s
 
             // Handle errors without contexts (other device-level errors)
             if (error.errorCode_ != rt::DeviceErrorCode::Unknown) {
-                GGML_LOG_ERROR("ET: Kernel '%s' failed with device error code %d\n",
+                GGML_LOG_ERROR("ET: Kernel '%s' failed with device error code %d on device %d\n",
                              kernel_name.c_str(),
-                             (int)error.errorCode_);
+                             (int)error.errorCode_,
+                             dev_ctx->devidx);
                 return false;
             }
         }
