@@ -11,6 +11,16 @@
 #include <cstring>
 #include <vector>
 
+#if __has_include(<filesystem>)
+#include <filesystem>
+namespace fs = std::filesystem;
+#elif __has_include(<experimental/filesystem>)
+#include <experimental/filesystem>
+namespace fs = std::experimental::filesystem;
+#else
+#error "cannot include the filesystem library"
+#endif
+
 /*
   ET Driver.
 
@@ -25,6 +35,39 @@ static struct ggml_et_driver {
     bool profiling_enabled = false;
 } _drv;
 
+// These assume et-platform was installed into /opt/et/
+#define SYSEMU_INSTALL_DIR "/opt/et/bin/"
+#define BL2_ELF "/opt/et/lib/esperanto-fw/ServiceProcessorBL2/fast-boot/ServiceProcessorBL2_fast-boot.elf"
+#define BOOTROM_TRAMPOLINE_TO_BL2_ELF "/opt/et/lib/esperanto-fw/BootromTrampolineToBL2/BootromTrampolineToBL2.elf"
+#define MACHINE_MINION_ELF "/opt/et/lib/esperanto-fw/MachineMinion/MachineMinion.elf"
+#define MASTER_MINION_ELF "/opt/et/lib/esperanto-fw/MasterMinion/MasterMinion.elf"
+#define WORKER_MINION_ELF "/opt/et/lib/esperanto-fw/WorkerMinion/WorkerMinion.elf"
+
+// from esperanto-tools-libs/tools/src/bench.cpp
+// config to setup the emulator instead of PCIe card
+inline auto getDefaultSysemuOptions() {
+  constexpr uint64_t kSysEmuMaxCycles = std::numeric_limits<uint64_t>::max();
+  constexpr uint64_t kSysEmuMinionShiresMask = 0x1FFFFFFFFu;
+
+  emu::SysEmuOptions sysEmuOptions;
+  sysEmuOptions.bootromTrampolineToBL2ElfPath = BOOTROM_TRAMPOLINE_TO_BL2_ELF;
+  sysEmuOptions.spBL2ElfPath = BL2_ELF;
+  sysEmuOptions.machineMinionElfPath = MACHINE_MINION_ELF;
+  sysEmuOptions.masterMinionElfPath = MASTER_MINION_ELF;
+  sysEmuOptions.workerMinionElfPath = WORKER_MINION_ELF;
+  sysEmuOptions.executablePath = std::string(SYSEMU_INSTALL_DIR) + "sys_emu";
+  sysEmuOptions.runDir = fs::current_path();
+  sysEmuOptions.maxCycles = kSysEmuMaxCycles;
+  sysEmuOptions.minionShiresMask = kSysEmuMinionShiresMask;
+  sysEmuOptions.puUart0Path = sysEmuOptions.runDir + "/pu_uart0_tx.log";
+  sysEmuOptions.puUart1Path = sysEmuOptions.runDir + "/pu_uart1_tx.log";
+  sysEmuOptions.spUart0Path = sysEmuOptions.runDir + "/spio_uart0_tx.log";
+  sysEmuOptions.spUart1Path = sysEmuOptions.runDir + "/spio_uart1_tx.log";
+  sysEmuOptions.startGdb = false;
+  sysEmuOptions.memcheck = false; // for emulator disable checking memory
+  return sysEmuOptions;
+}
+
 // Forward declaration
 static void ggml_et_driver_cleanup();
 
@@ -33,7 +76,11 @@ static bool ggml_et_driver_init() {
 	assert(_drv.device_layer != nullptr);
     } else {
 	try {
-	    _drv.device_layer = dev::IDeviceLayer::createPcieDeviceLayer();
+        // For physical PCIe device:
+        // _drv.device_layer = dev::IDeviceLayer::createPcieDeviceLayer();
+        // For emulator device using above sysEmuOptions:
+        _drv.device_layer = dev::IDeviceLayer::createSysEmuDeviceLayer(getDefaultSysemuOptions());
+
 	    _drv.runtime = rt::IRuntime::create(_drv.device_layer);
 	    GGML_LOG_INFO("ET: FOUND %d devices!\n", _drv.device_layer->getDevicesCount());
 
