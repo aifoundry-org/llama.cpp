@@ -536,7 +536,13 @@ static void ggml_backend_et_get_tensor_async(ggml_backend_t      backend,
     const std::byte * src_ptr = static_cast<const std::byte *>(tensor->data) + offset;
     std::byte *       dst_ptr = static_cast<std::byte *>(data);
 
-    runtime->memcpyDeviceToHost(stream, src_ptr, dst_ptr, size, true /*barrier*/);
+    // The runtime performs the host-side copy on a worker thread. We must wait
+    // for it here: the caller may free the host destination buffer (e.g. the
+    // logits/output buffer during llama_context teardown) before the next
+    // stream-level synchronize, which would leave this copy writing into freed
+    // memory (heap-use-after-free).
+    rt::EventId event = runtime->memcpyDeviceToHost(stream, src_ptr, dst_ptr, size, true /*barrier*/);
+    runtime->waitForEvent(event);
 }
 
 static bool ggml_backend_et_cpy_tensor_async(ggml_backend_t      backend_src,
