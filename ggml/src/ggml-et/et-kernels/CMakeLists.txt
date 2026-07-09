@@ -5,6 +5,15 @@
 # This keeps kernels in compile_commands.json for full IDE support.
 
 # --- RISC-V toolchain setup (scoped to this directory) ---
+# Host-only sanitizer flags (-fsanitize=... from GGML_SANITIZE_*) are added at
+# the ggml/src scope and would otherwise propagate here and break the baremetal
+# RISC-V kernel link. Strip inherited host build flags for this directory only
+# when a sanitizer build is requested.
+if (GGML_SANITIZE_ADDRESS OR GGML_SANITIZE_THREAD OR GGML_SANITIZE_UNDEFINED)
+    set_property(DIRECTORY PROPERTY COMPILE_OPTIONS "")
+    set_property(DIRECTORY PROPERTY LINK_OPTIONS "")
+    set_property(DIRECTORY PROPERTY LINK_LIBRARIES "")
+endif()
 set(TOOLCHAIN_DIR ${ET_PLATFORM_PATH})
 include(${ET_PLATFORM_PATH}/lib/cmake/riscv64-ec-toolchain.cmake)
 set(CMAKE_ADDR2LINE "${TOOLCHAIN_DIR}/bin/riscv64-unknown-elf-addr2line")
