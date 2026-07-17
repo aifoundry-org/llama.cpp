@@ -10,6 +10,7 @@
 #include "ggml.h"
 #include <stdarg.h>
 
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -83,6 +84,7 @@ static struct ggml_et_driver {
     std::unique_ptr<std::ofstream> profile_stream;
     std::unique_ptr<std::ofstream> kernel_id_stream;
     std::vector<std::pair<std::string, rt::KernelId>> kernel_map;
+    std::atomic<bool> runtime_error_seen{false};
     bool profiling_enabled = false;
 } _drv;
 
@@ -169,6 +171,21 @@ static bool ggml_et_driver_init() {
         #endif
 
 	    _drv.runtime = rt::IRuntime::create(_drv.device_layer);
+        _drv.runtime_error_seen.store(false, std::memory_order_relaxed);
+        _drv.runtime->setOnStreamErrorsCallback(
+            [](rt::EventId id, const rt::StreamError& err) {
+                _drv.runtime_error_seen.store(true, std::memory_order_relaxed);
+                GGML_LOG_ERROR(
+                    "ET: stream error callback event=%d code=%d\n",
+                    (int)id,
+                    (int)err.errorCode_);
+            });
+        _drv.runtime->setOnKernelAbortedErrorCallback(
+            [](rt::EventId id, std::byte*, size_t, std::function<void()> free_result) {
+                _drv.runtime_error_seen.store(true, std::memory_order_relaxed);
+                GGML_LOG_ERROR("ET: kernel aborted callback event=%d\n", (int)id);
+                free_result();
+            });
 
 	    // Initialize profiler if requested via environment variable
 	    const char* profile_path = getenv("GGML_ET_PROFILE");
@@ -521,10 +538,16 @@ static void ggml_backend_et_synchronize(ggml_backend_t backend) {
     }
 
     ggml_backend_et_device_context * dev_ctx = (ggml_backend_et_device_context *)backend->device->context;
-    runtime->waitForStream(dev_ctx->default_stream);
+    try {
+        runtime->waitForStream(dev_ctx->default_stream);
+    } catch (const std::exception& e) {
+        _drv.runtime_error_seen.store(true, std::memory_order_relaxed);
+        GGML_LOG_ERROR("ET: synchronization failed: %s\n", e.what());
+        abort();
+    }
 
     auto errors = runtime->retrieveStreamErrors(dev_ctx->default_stream);
-    if(errors.empty()) {
+    if (errors.empty() && !_drv.runtime_error_seen.load(std::memory_order_relaxed)) {
         return;
     }
     for(const auto& err : errors) {
@@ -584,6 +607,10 @@ static enum ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, gg
     ggml_backend_et_device_context * dev_ctx = (ggml_backend_et_device_context *)backend->device->context;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (_drv.runtime_error_seen.load(std::memory_order_relaxed)) {
+            GGML_LOG_ERROR("ET: refusing to schedule graph nodes after a runtime error\n");
+            return GGML_STATUS_FAILED;
+        }
         ggml_tensor * node = cgraph->nodes[i];
 
         if (node->op == GGML_OP_NONE) {
@@ -592,26 +619,30 @@ static enum ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, gg
 
         // --- Fusion checks (before regular dispatch) ---
         if (ggml_et_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
-            ggml_et_op_rms_norm_mul(dev_ctx, node, cgraph->nodes[i + 1]);
+            if (!ggml_et_op_rms_norm_mul(dev_ctx, node, cgraph->nodes[i + 1])) {
+                GGML_LOG_ERROR("ET: fused RMS_NORM_MUL dispatch failed\n");
+                return GGML_STATUS_FAILED;
+            }
             i++;  // skip the MUL node
             continue;
         }
 
+        bool dispatched = true;
         switch (node->op) {
             case GGML_OP_MUL:
-                ggml_et_op_mul(dev_ctx, node);
+                dispatched = ggml_et_op_mul(dev_ctx, node);
                 break;
 
             case GGML_OP_ADD:
-                ggml_et_op_add(dev_ctx, node);
+                dispatched = ggml_et_op_add(dev_ctx, node);
                 break;
 
             case GGML_OP_SUB:
-                ggml_et_op_sub(dev_ctx, node);
+                dispatched = ggml_et_op_sub(dev_ctx, node);
                 break;
 
             case GGML_OP_MUL_MAT:
-                ggml_et_op_mul_mat(dev_ctx, node);
+                dispatched = ggml_et_op_mul_mat(dev_ctx, node);
 
                 // if (once < 100){
                 //     uint64_t * host_data = (uint64_t *) node->data;
@@ -624,51 +655,51 @@ static enum ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, gg
                 break;
 
             case GGML_OP_MUL_MAT_ID:
-                ggml_et_op_mul_mat_id(dev_ctx, node);
+                dispatched = ggml_et_op_mul_mat_id(dev_ctx, node);
                 break;
 
             case GGML_OP_ROPE:
-                ggml_et_op_rope(dev_ctx, node);
+                dispatched = ggml_et_op_rope(dev_ctx, node);
                 break;
 
             case GGML_OP_RMS_NORM:
-                ggml_et_op_rms_norm(dev_ctx, node);
+                dispatched = ggml_et_op_rms_norm(dev_ctx, node);
                 break;
 
             case GGML_OP_NORM:
-                ggml_et_op_norm(dev_ctx, node);
+                dispatched = ggml_et_op_norm(dev_ctx, node);
                 break;
 
             case GGML_OP_UNARY:
-                ggml_et_op_unary(dev_ctx, node);
+                dispatched = ggml_et_op_unary(dev_ctx, node);
                 break;
 
             case GGML_OP_IM2COL:
-                ggml_et_op_im2col(dev_ctx, node);
+                dispatched = ggml_et_op_im2col(dev_ctx, node);
                 break;
 
             case GGML_OP_SCALE:
-                ggml_et_op_scale(dev_ctx, node);
+                dispatched = ggml_et_op_scale(dev_ctx, node);
                 break;
 
             case GGML_OP_GLU:
-                ggml_et_op_glu(dev_ctx, node);
+                dispatched = ggml_et_op_glu(dev_ctx, node);
                 break;
 
             case GGML_OP_SOFT_MAX:
-                ggml_et_op_softmax(dev_ctx, node);
+                dispatched = ggml_et_op_softmax(dev_ctx, node);
                 break;
 
             case GGML_OP_GET_ROWS:
-                ggml_et_op_get_rows(dev_ctx, node);
+                dispatched = ggml_et_op_get_rows(dev_ctx, node);
                 break;
 
             case GGML_OP_CONT:
-                ggml_et_op_cont(dev_ctx, node);
+                dispatched = ggml_et_op_cont(dev_ctx, node);
                 break;
 
             case GGML_OP_SET_ROWS:
-                ggml_et_op_set_rows(dev_ctx, node);
+                dispatched = ggml_et_op_set_rows(dev_ctx, node);
                 break;
 
             case GGML_OP_RESHAPE:
@@ -682,9 +713,18 @@ static enum ggml_status ggml_backend_et_graph_compute(ggml_backend_t backend, gg
                 GGML_LOG_ERROR("ET: Unsupported operation in graph: %s", ggml_op_name(node->op));
                 return GGML_STATUS_FAILED;
         }
+        if (!dispatched) {
+            GGML_LOG_ERROR(
+                "ET: operation dispatch failed for node %d (%s)\n",
+                i,
+                ggml_op_name(node->op));
+            return GGML_STATUS_FAILED;
+        }
     }
 
-    return GGML_STATUS_SUCCESS;
+    return _drv.runtime_error_seen.load(std::memory_order_relaxed)
+        ? GGML_STATUS_FAILED
+        : GGML_STATUS_SUCCESS;
 }
 
 static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
