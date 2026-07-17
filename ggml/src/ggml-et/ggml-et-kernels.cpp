@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <cstring>
 
+static constexpr size_t GGML_ET_MAX_PENDING_KERNEL_EVENTS = 4096;
+
 #define ET_TRACE_DECODER_IMPL
 #include <et-trace/decoder.h>
 #include <et-trace/layout.h>
@@ -124,6 +126,22 @@ bool ggml_et_launch_kernel(ggml_backend_et_device_context* dev_ctx, const std::s
     rt::KernelId kernel_id = kernel_it->second;
 
     try {
+        // Runtime EventId is 16-bit. Bound the number of simultaneously live
+        // events well below 65,536 so a long decode can never reuse an ID that
+        // is still in flight, even on host runtimes predating the allocator fix.
+        if (dev_ctx->pending_kernel_events >= GGML_ET_MAX_PENDING_KERNEL_EVENTS) {
+            if (!runtime->waitForStream(dev_ctx->default_stream)) {
+                GGML_LOG_ERROR("ET: timed out draining the stream before EventId wraparound\n");
+                return false;
+            }
+            auto errors = runtime->retrieveStreamErrors(dev_ctx->default_stream);
+            if (!errors.empty()) {
+                GGML_LOG_ERROR("ET: stream drain before EventId wraparound reported errors\n");
+                return false;
+            }
+            dev_ctx->pending_kernel_events = 0;
+        }
+
         // Setup kernel launch options
         rt::KernelLaunchOptions k_opts;
         k_opts.setShireMask(shire_mask);  // Default: all shires (0xFFFFFFFF)
@@ -142,7 +160,11 @@ bool ggml_et_launch_kernel(ggml_backend_et_device_context* dev_ctx, const std::s
         }
 
         if(sync_error_check) {
-            runtime->waitForStream(dev_ctx->default_stream);
+            if (!runtime->waitForStream(dev_ctx->default_stream)) {
+                GGML_LOG_ERROR("ET: timed out before kernel \"%s\" launch\n", kernel_name.c_str());
+                return false;
+            }
+            dev_ctx->pending_kernel_events = 0;
             auto errors = runtime->retrieveStreamErrors(dev_ctx->default_stream);
             if(!errors.empty()) {
                 GGML_LOG_ERROR("ET: Errors detected before kernel \"%s\" launch\n", kernel_name.c_str());
@@ -154,13 +176,18 @@ bool ggml_et_launch_kernel(ggml_backend_et_device_context* dev_ctx, const std::s
         }
 
         runtime->kernelLaunch(dev_ctx->default_stream, kernel_id,
-                             reinterpret_cast<std::byte*>(params), params_size, k_opts);
+                              reinterpret_cast<std::byte*>(params), params_size, k_opts);
+        ++dev_ctx->pending_kernel_events;
 
         if(enable_print) {
             std::vector<std::byte> hostTraceBuf(ET_TRACE_BUFFER_SIZE);
             runtime->memcpyDeviceToHost(
                 dev_ctx->default_stream, dev_ctx->trace_buffer, hostTraceBuf.data(), ET_TRACE_BUFFER_SIZE);
-            runtime->waitForStream(dev_ctx->default_stream);
+            if (!runtime->waitForStream(dev_ctx->default_stream)) {
+                GGML_LOG_ERROR("ET: timed out waiting for trace output\n");
+                return false;
+            }
+            dev_ctx->pending_kernel_events = 0;
             const auto* traceHeader = reinterpret_cast<const trace_buffer_std_header_t*>(hostTraceBuf.data());
             const trace_entry_header_t* entry = nullptr;
             while ((entry = Trace_Decode(traceHeader, entry))) {
@@ -175,7 +202,11 @@ bool ggml_et_launch_kernel(ggml_backend_et_device_context* dev_ctx, const std::s
         if(sync_error_check) {
             // Already triggered. No need to retrigger
             if(!enable_print) {
-                runtime->waitForStream(dev_ctx->default_stream);
+                if (!runtime->waitForStream(dev_ctx->default_stream)) {
+                    GGML_LOG_ERROR("ET: timed out waiting for kernel \"%s\"\n", kernel_name.c_str());
+                    return false;
+                }
+                dev_ctx->pending_kernel_events = 0;
             }
             auto errors = runtime->retrieveStreamErrors(dev_ctx->default_stream);
             if(!errors.empty()) {

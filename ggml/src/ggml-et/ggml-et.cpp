@@ -539,7 +539,12 @@ static void ggml_backend_et_synchronize(ggml_backend_t backend) {
 
     ggml_backend_et_device_context * dev_ctx = (ggml_backend_et_device_context *)backend->device->context;
     try {
-        runtime->waitForStream(dev_ctx->default_stream);
+        if (!runtime->waitForStream(dev_ctx->default_stream)) {
+            _drv.runtime_error_seen.store(true, std::memory_order_relaxed);
+            GGML_LOG_ERROR("ET: synchronization timed out\n");
+            abort();
+        }
+        dev_ctx->pending_kernel_events = 0;
     } catch (const std::exception& e) {
         _drv.runtime_error_seen.store(true, std::memory_order_relaxed);
         GGML_LOG_ERROR("ET: synchronization failed: %s\n", e.what());
