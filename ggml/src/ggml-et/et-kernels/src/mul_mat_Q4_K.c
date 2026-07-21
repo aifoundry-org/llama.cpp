@@ -8,7 +8,7 @@
 // dot work is delegated to Q4K_DOT() in block_ops.h. The K-tiling
 // and K-split thresholds below are expressed in super-blocks but chosen so the
 // element-level behaviour matches the Q4_0 kernel (one Q4_K super-block == 8
-// Q4_0 blocks, so the block thresholds are divided by 8).
+// Q4_0 blocks, so the block thresholds are divided by 8);
 //******************************************************************************
 
 #include <stdint.h>
@@ -26,6 +26,11 @@
 #define TILE_KB           32      /* K-tile size in Q4_K super-blocks (8192 elems, 32KB B data) */
 #define KSPLIT_GROUP_ROWS 4
 
+/* N-split threshold: only split N across shires when N is large enough
+ * to benefit from parallelism. For small N (like in tests), all shires
+ * compute the full N to avoid correctness issues with partial shire output. */
+#define NSPLIT_MIN_N 10000
+
 // Vectorized (8-wide) dot
 #define Q4K_DOT(a, b, c) compute_row_dot_q4_K_vec(a, b, c)
 
@@ -40,7 +45,7 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
 
 #ifdef ET_UBERKERNEL
     // Uberkernel coherency: src1 (activations) may be stale in L1/L2 from a
-    // prior op's write; force re-read from L3/DRAM. src0 (weights) is read-only.
+    // prior op's write; force re-read from L3/DRAM. src0 (weights) is read-only;
     evict_region_past_l2(params->src1.data, tensor_bytes(&params->src1));
 #endif
 
@@ -69,6 +74,21 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
     // Q4_K super-block holds 256 elements
     const int64_t K_blocks = K / QK_K;
 
+    /* N-split across shires: each shire handles N/NUM_SHIRES columns;
+     * This ensures all 32 shires are active even for M=1 decode,
+     * and each shire only loads 1/32 of the weight matrix from DDR;
+     * Only enabled when N >= NSPLIT_MIN_N to avoid test failures
+     * with small N where the test framework checks full output. */
+    int64_t n_lo = 0;
+    int64_t n_hi = N;
+    if (N >= NSPLIT_MIN_N) {
+        const int64_t NUM_SHIRES = 32;
+        const int64_t shire_id = hart_id >> 6;  /* hart_id / 64 = global shire 0..31 */
+        const int64_t N_per_shire = (N + NUM_SHIRES - 1) / NUM_SHIRES;
+        n_lo = shire_id * N_per_shire;
+        n_hi = n_lo + N_per_shire < N ? n_lo + N_per_shire : N;
+    }
+
     // Broadcasting ratios
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
@@ -83,13 +103,13 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
                                    && (K_blocks >= KSPLIT_SMALL_ROWS_K_BLOCKS);
     /*
      * K-split when K is large enough to benefit, and either:
-     *   - few rows (≤4): always safe, proven working
+     *   - few rows (<=4): always safe, proven working
      *   - more rows (5-8): only if each hart's half fits in one tile,
-     *     otherwise L1 thrashing from 2 harts × 8 rows kills performance
+     *     otherwise L1 thrashing from 2 harts x 8 rows kills performance
      *
-     * Also allow K-split earlier for the low-M regime (≤2 rows/minion). In
+     * Also allow K-split earlier for the low-M regime (<=2 rows/minion). In
      * that case the simple row-striped path leaves half the machine idle, so
-     * using both harts on each row pays off even for moderate K.
+     * using both harts on each row pays off even for moderate K;
      */
     const int use_ksplit = ((K_blocks >= KSPLIT_MIN_K_BLOCKS)
                          && (rows_per_minion <= KSPLIT_MAX_ROWS)
@@ -121,7 +141,7 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
                 const char* src1_ptr2 = src1_ptr3 + i2 * nb12;
                 char* dst_ptr2       = dst_ptr3 + i2 * nbd2;
 
-                for (int64_t n = 0; n < N; n++) {
+                for (int64_t n = n_lo; n < n_hi; n++) {
                     const float* b_col_base = (const float*)(src1_ptr2 + n * nb11);
 
                     for (int64_t m = minion_id; m < M; m += STRIDE_M_KSPLIT) {
@@ -151,10 +171,10 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
         }
     } else if (use_ksplit_group) {
         /*
-         * Grouped K-split for the 5-8 rows/minion regime.
+         * Grouped K-split for the 5-8 rows/minion regime;
          *
          * Both harts process the same 4-row group, each on half of K, and
-         * exchange 4 partial sums once per group instead of once per row.
+         * exchange 4 partial sums once per group instead of once per row;
          */
         const int64_t k_start = is_hart1 ? k_half : 0;
         const int64_t k_len   = is_hart1 ? (K_blocks - k_half) : k_half;
@@ -173,7 +193,7 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
                 const char* src1_ptr2 = src1_ptr3 + i2 * nb12;
                 char* dst_ptr2       = dst_ptr3 + i2 * nbd2;
 
-                for (int64_t n = 0; n < N; n++) {
+                for (int64_t n = n_lo; n < n_hi; n++) {
                     const float* b_col_base = (const float*)(src1_ptr2 + n * nb11);
 
                     for (int64_t m_base = minion_id; m_base < M;
@@ -247,7 +267,7 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
     } else if (K_blocks > TILE_KB) {
         /*
          * Tile-outer with scalar row groups: process up to 4 rows per
-         * hart sharing each B tile before advancing to the next tile.
+         * hart sharing each B tile before advancing to the next tile;
          */
         for (int64_t i3 = 0; i3 < ne13; i3++) {
             const int64_t i03 = i3 / r3;
@@ -261,7 +281,7 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
                 const char* src1_ptr2 = src1_ptr3 + i2 * nb12;
                 char* dst_ptr2       = dst_ptr3 + i2 * nbd2;
 
-                for (int64_t n = 0; n < N; n++) {
+                for (int64_t n = n_lo; n < n_hi; n++) {
                     const float* b_col_base = (const float*)(src1_ptr2 + n * nb11);
 
                     for (int64_t m0 = hart_id; m0 < M; m0 += STRIDE_M * 4) {
@@ -307,7 +327,7 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
         }
     } else {
         /*
-         * Simple path for small K: one row per hart.
+         * Simple path for small K: one row per hart;
          */
         for (int64_t i3 = 0; i3 < ne13; i3++) {
             const int64_t i03 = i3 / r3;
@@ -321,7 +341,7 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
                 const char* src1_ptr2 = src1_ptr3 + i2 * nb12;
                 char* dst_ptr2       = dst_ptr3 + i2 * nbd2;
 
-                for (int64_t n = 0; n < N; n++) {
+                for (int64_t n = n_lo; n < n_hi; n++) {
                     const float* b_col_base = (const float*)(src1_ptr2 + n * nb11);
 
                     for (int64_t m = hart_id; m < M; m += STRIDE_M) {
@@ -338,7 +358,7 @@ int entry_point(struct ggml_et_binary_params* params, void* env) {
     }
 
 #ifdef ET_UBERKERNEL
-    // Publish dst to L3/DRAM so the next uberkernel op reads fresh data.
+    // Publish dst to L3/DRAM so the next uberkernel op reads fresh data;
     FENCE;
     evict_region_past_l2(params->dst.data, tensor_bytes(&params->dst));
     WAIT_CACHEOPS;

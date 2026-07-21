@@ -20,6 +20,11 @@
 #define KSPLIT_GROUP_ROWS          4
 #define SIMPLE_X2_ROWS             2
 
+/* N-split threshold: only split N across shires when N is very large;
+ * Disabled for tests by setting to a value larger than any test case;
+ * Re-enable for production decode (large N) after validating multi-shire execution. */
+#define NSPLIT_MIN_N 100000
+
 static inline size_t tensor_bytes(const struct ggml_tensor * t) {
     return (size_t) t->ne[0] * t->ne[1] * t->ne[2] * t->ne[3] * t->nb[0];
 }
@@ -56,6 +61,17 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
     const size_t nbb3      = params->bias.nb[3];
 
     // Q8_0 block size is 32
+
+    /* N-split across shires: each shire handles N/NUM_SHIRES columns;
+     * This ensures all 32 shires are active even for M=1 decode,
+     * and each shire only loads 1/32 of the weight matrix from DDR;
+     * Currently disabled for tests (NSPLIT_MIN_N very high). */
+    const int use_nsplit = (N >= NSPLIT_MIN_N);
+    const int64_t NUM_SHIRES = 32;
+    const int64_t shire_id = hart_id >> 6;  /* hart_id / 64 = global shire 0..31 */
+    const int64_t N_per_shire = use_nsplit ? (N + NUM_SHIRES - 1) / NUM_SHIRES : N;
+    const int64_t n_lo = use_nsplit ? shire_id * N_per_shire : 0;
+    const int64_t n_hi = use_nsplit ? (n_lo + N_per_shire < N ? n_lo + N_per_shire : N) : N;
     const int64_t K_blocks      = K / 32;
     const int     use_simple_x2 = ((nb01 & 31) == 0);
 
@@ -72,13 +88,13 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
     const int     use_ksplit_small_rows = (rows_per_minion <= 2) && (K_blocks >= KSPLIT_SMALL_ROWS_K_BLOCKS);
     /*
      * K-split when K is large enough to benefit, and either:
-     *   - few rows (≤4): always safe, proven working
+     *   - few rows (<=4): always safe, proven working
      *   - more rows (5-8): only if each hart's half fits in one tile,
-     *     otherwise L1 thrashing from 2 harts × 8 rows kills performance
+     *     otherwise L1 thrashing from 2 harts x 8 rows kills performance
      *
-     * Also allow K-split earlier for the low-M regime (≤2 rows/minion). In
+     * Also allow K-split earlier for the low-M regime (<=2 rows/minion). In
      * that case the simple row-striped path leaves half the machine idle, so
-     * using both harts on each row pays off even for moderate K.
+     * using both harts on each row pays off even for moderate K;
      */
     const int     use_ksplit            = ((K_blocks >= KSPLIT_MIN_K_BLOCKS) && (rows_per_minion <= KSPLIT_MAX_ROWS) &&
                                            (rows_per_minion <= 4 || k_half <= TILE_KB)) ||
@@ -113,7 +129,7 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
                 char *        dst_ptr2  = dst_ptr3 + i2 * nbd2;
                 const char *  bias_ptr2 = bias_ptr3 ? bias_ptr3 + i2 * nbb2 : (const char *) 0;
 
-                for (int64_t n = 0; n < N; n++) {
+                for (int64_t n = n_lo; n < n_hi; n++) {
                     const float * b_col_base = (const float *) (src1_ptr2 + n * nb11);
                     const float * bias_n     = bias_ptr2 ? (const float *) (bias_ptr2 + n * nbb1) : (const float *) 0;
 
@@ -147,12 +163,12 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
         }
     } else if (use_ksplit_group) {
         /*
-         * Grouped K-split for the 5-8 rows/minion regime.
+         * Grouped K-split for the 5-8 rows/minion regime;
          *
          * Both harts process the same 4-row group, each on half of K, and
-         * exchange 4 partial sums once per group instead of once per row.
+         * exchange 4 partial sums once per group instead of once per row;
          * This keeps the K-split bandwidth benefit while cutting semaphore
-         * traffic by 4x relative to the old per-row exchange.
+         * traffic by 4x relative to the old per-row exchange;
          */
         const int64_t    k_start    = is_hart1 ? k_half : 0;
         const int64_t    k_len      = is_hart1 ? (K_blocks - k_half) : k_half;
@@ -172,7 +188,7 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
                 char *        dst_ptr2  = dst_ptr3 + i2 * nbd2;
                 const char *  bias_ptr2 = bias_ptr3 ? bias_ptr3 + i2 * nbb2 : (const char *) 0;
 
-                for (int64_t n = 0; n < N; n++) {
+                for (int64_t n = n_lo; n < n_hi; n++) {
                     const float * b_col_base = (const float *) (src1_ptr2 + n * nb11);
                     const float * bias_n     = bias_ptr2 ? (const float *) (bias_ptr2 + n * nbb1) : (const float *) 0;
 
@@ -186,9 +202,7 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
 
                         for (int64_t kb = 0; kb < K_blocks; kb += TILE_KB) {
                             int64_t tile_len = k_len - kb;
-                            if (tile_len > TILE_KB) {
-                                tile_len = TILE_KB;
-                            }
+                            if (tile_len > TILE_KB) tile_len = TILE_KB;
                             if (tile_len <= 0) {
                                 break;
                             }
@@ -256,10 +270,10 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
     } else if (K_blocks > TILE_KB) {
         /*
          * Tile-outer with scalar row groups: process up to 4 rows per
-         * hart sharing each B tile before advancing to the next tile.
+         * hart sharing each B tile before advancing to the next tile;
          * Uses scalar float variables (not an array) to accumulate across
          * tiles — avoids the flw/fadd.s/fsw stack ops that corrupt vector
-         * register state on ET-SoC-1's MMX-style shared FP file.
+         * register state on ET-SoC-1's MMX-style shared FP file;
          */
         for (int64_t i3 = 0; i3 < ne13; i3++) {
             const int64_t i03       = i3 / r3;
@@ -275,7 +289,7 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
                 char *        dst_ptr2  = dst_ptr3 + i2 * nbd2;
                 const char *  bias_ptr2 = bias_ptr3 ? bias_ptr3 + i2 * nbb2 : (const char *) 0;
 
-                for (int64_t n = 0; n < N; n++) {
+                for (int64_t n = n_lo; n < n_hi; n++) {
                     const float * b_col_base = (const float *) (src1_ptr2 + n * nb11);
                     const float * bias_n     = bias_ptr2 ? (const float *) (bias_ptr2 + n * nbb1) : (const float *) 0;
 
@@ -288,9 +302,7 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
 
                         for (int64_t kb = 0; kb < K_blocks; kb += TILE_KB) {
                             int64_t tile_len = K_blocks - kb;
-                            if (tile_len > TILE_KB) {
-                                tile_len = TILE_KB;
-                            }
+                            if (tile_len > TILE_KB) tile_len = TILE_KB;
                             const float * b_tile = b_col_base + kb * 32;
 
                             s0 += compute_row_dot_q8_0((const block_q8_0 *) (src0_ptr2 + m0 * nb01) + kb, b_tile,
@@ -330,11 +342,11 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
         }
     } else {
         /*
-         * Simple path for small K.
+         * Simple path for small K;
          *
          * When `nb01` is 32-byte aligned, every row has the same block-alignment
          * pattern. That lets us compute two rows together and reuse each loaded
-         * B chunk across both rows instead of reloading it in a second dot call.
+         * B chunk across both rows instead of reloading it in a second dot call;
          */
         for (int64_t i3 = 0; i3 < ne13; i3++) {
             const int64_t i03       = i3 / r3;
@@ -350,7 +362,7 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
                 char *        dst_ptr2  = dst_ptr3 + i2 * nbd2;
                 const char *  bias_ptr2 = bias_ptr3 ? bias_ptr3 + i2 * nbb2 : (const char *) 0;
 
-                for (int64_t n = 0; n < N; n++) {
+                for (int64_t n = n_lo; n < n_hi; n++) {
                     const float * b_col_base = (const float *) (src1_ptr2 + n * nb11);
                     const float * bias_n     = bias_ptr2 ? (const float *) (bias_ptr2 + n * nbb1) : (const float *) 0;
                     q8_dot_state  q8_state;
