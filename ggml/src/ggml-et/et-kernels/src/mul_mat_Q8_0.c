@@ -335,59 +335,47 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
          * When `nb01` is 32-byte aligned, every row has the same block-alignment
          * pattern. That lets us compute two rows together and reuse each loaded
          * B chunk across both rows instead of reloading it in a second dot call.
+         *
+         * For generation (M=1..4), M-split leaves most harts idle (only 1-4
+         * active out of 2048). N-split distributes the N dimension across harts
+         * instead, keeping all N harts busy — a 100-2000x utilization gain.
          */
-        for (int64_t i3 = 0; i3 < ne13; i3++) {
-            const int64_t i03       = i3 / r3;
-            const char *  src0_ptr3 = (const char *) params->src0.data + i03 * nb03;
-            const char *  src1_ptr3 = (const char *) params->src1.data + i3 * nb13;
-            char *        dst_ptr3  = (char *) params->dst.data + i3 * nbd3;
-            const char *  bias_ptr3 = bias_base ? bias_base + i3 * nbb3 : (const char *) 0;
+        const int use_n_split = (M <= 4 && N > M && N >= 32);
+        if (use_n_split) {
+            /*
+             * N-split: distribute output columns across harts.
+             * Each hart processes ALL rows (M) for its subset of columns.
+             * This keeps many harts active during generation where M=1.
+             */
+            const int64_t total_harts = 2048;
+            const int64_t n_per_hart  = (N + total_harts - 1) / total_harts;
+            const int64_t n_start     = hart_id * n_per_hart;
+            const int64_t n_end       = (n_start + n_per_hart < N) ? (n_start + n_per_hart) : N;
 
-            for (int64_t i2 = 0; i2 < ne12; i2++) {
-                const int64_t i02       = i2 / r2;
-                const char *  src0_ptr2 = src0_ptr3 + i02 * nb02;
-                const char *  src1_ptr2 = src1_ptr3 + i2 * nb12;
-                char *        dst_ptr2  = dst_ptr3 + i2 * nbd2;
-                const char *  bias_ptr2 = bias_ptr3 ? bias_ptr3 + i2 * nbb2 : (const char *) 0;
+            for (int64_t i3 = 0; i3 < ne13; i3++) {
+                const int64_t i03       = i3 / r3;
+                const char *  src0_ptr3 = (const char *) params->src0.data + i03 * nb03;
+                const char *  src1_ptr3 = (const char *) params->src1.data + i3 * nb13;
+                char *        dst_ptr3  = (char *) params->dst.data + i3 * nbd3;
+                const char *  bias_ptr3 = bias_base ? bias_base + i3 * nbb3 : (const char *) 0;
 
-                for (int64_t n = 0; n < N; n++) {
-                    const float * b_col_base = (const float *) (src1_ptr2 + n * nb11);
-                    const float * bias_n     = bias_ptr2 ? (const float *) (bias_ptr2 + n * nbb1) : (const float *) 0;
-                    q8_dot_state  q8_state;
+                for (int64_t i2 = 0; i2 < ne12; i2++) {
+                    const int64_t i02       = i2 / r2;
+                    const char *  src0_ptr2 = src0_ptr3 + i02 * nb02;
+                    const char *  src1_ptr2 = src1_ptr3 + i2 * nb12;
+                    char *        dst_ptr2  = dst_ptr3 + i2 * nbd2;
+                    const char *  bias_ptr2 = bias_ptr3 ? bias_ptr3 + i2 * nbb2 : (const char *) 0;
+
+                    q8_dot_state q8_state;
                     q8_dot_begin(&q8_state);
 
-                    if (use_simple_x2) {
-                        for (int64_t m0 = hart_id; m0 < M; m0 += STRIDE_M * SIMPLE_X2_ROWS) {
-                            const int64_t      m1     = m0 + STRIDE_M;
-                            const block_q8_0 * q_row0 = (const block_q8_0 *) (src0_ptr2 + m0 * nb01);
+                    for (int64_t n = n_start; n < n_end; n++) {
+                        const float * b_col_base = (const float *) (src1_ptr2 + n * nb11);
+                        const float * bias_n     = bias_ptr2 ? (const float *) (bias_ptr2 + n * nbb1) : (const float *) 0;
 
-                            if (m1 < M) {
-                                const block_q8_0 * q_row1 = (const block_q8_0 *) (src0_ptr2 + m1 * nb01);
-                                float              s0, s1;
-                                q8_dot_compute_x2_aligned(q_row0, q_row1, b_col_base, K_blocks, &s0, &s1);
-
-                                float * dst0 = (float *) (dst_ptr2 + n * nbd1 + m0 * sizeof(float));
-                                float * dst1 = (float *) (dst_ptr2 + n * nbd1 + m1 * sizeof(float));
-                                if (bias_n) {
-                                    s0 += bias_n[m0];
-                                    s1 += bias_n[m1];
-                                }
-                                atomic_store_f32((volatile float *) dst0, s0);
-                                atomic_store_f32((volatile float *) dst1, s1);
-                            } else {
-                                float   sum = q8_dot_compute(q_row0, b_col_base, K_blocks);
-                                float * dst = (float *) (dst_ptr2 + n * nbd1 + m0 * sizeof(float));
-                                if (bias_n) {
-                                    sum += bias_n[m0];
-                                }
-                                atomic_store_f32((volatile float *) dst, sum);
-                            }
-                        }
-                    } else {
-                        for (int64_t m = hart_id; m < M; m += STRIDE_M) {
+                        for (int64_t m = 0; m < M; m++) {
                             const block_q8_0 * q_row = (const block_q8_0 *) (src0_ptr2 + m * nb01);
-
-                            float sum = q8_dot_compute(q_row, b_col_base, K_blocks);
+                            float              sum   = q8_dot_compute(q_row, b_col_base, K_blocks);
 
                             float * dst_entry = (float *) (dst_ptr2 + n * nbd1 + m * sizeof(float));
                             if (bias_n) {
@@ -398,6 +386,72 @@ int entry_point(struct ggml_et_mm_q8_params * params, void * env) {
                     }
 
                     q8_dot_end(&q8_state);
+                }
+            }
+        } else {
+            for (int64_t i3 = 0; i3 < ne13; i3++) {
+                const int64_t i03       = i3 / r3;
+                const char *  src0_ptr3 = (const char *) params->src0.data + i03 * nb03;
+                const char *  src1_ptr3 = (const char *) params->src1.data + i3 * nb13;
+                char *        dst_ptr3  = (char *) params->dst.data + i3 * nbd3;
+                const char *  bias_ptr3 = bias_base ? bias_base + i3 * nbb3 : (const char *) 0;
+
+                for (int64_t i2 = 0; i2 < ne12; i2++) {
+                    const int64_t i02       = i2 / r2;
+                    const char *  src0_ptr2 = src0_ptr3 + i02 * nb02;
+                    const char *  src1_ptr2 = src1_ptr3 + i2 * nb12;
+                    char *        dst_ptr2  = dst_ptr3 + i2 * nbd2;
+                    const char *  bias_ptr2 = bias_ptr3 ? bias_ptr3 + i2 * nbb2 : (const char *) 0;
+
+                    for (int64_t n = 0; n < N; n++) {
+                        const float * b_col_base = (const float *) (src1_ptr2 + n * nb11);
+                        const float * bias_n     = bias_ptr2 ? (const float *) (bias_ptr2 + n * nbb1) : (const float *) 0;
+                        q8_dot_state  q8_state;
+                        q8_dot_begin(&q8_state);
+
+                        if (use_simple_x2) {
+                            for (int64_t m0 = hart_id; m0 < M; m0 += STRIDE_M * SIMPLE_X2_ROWS) {
+                                const int64_t      m1     = m0 + STRIDE_M;
+                                const block_q8_0 * q_row0 = (const block_q8_0 *) (src0_ptr2 + m0 * nb01);
+
+                                if (m1 < M) {
+                                    const block_q8_0 * q_row1 = (const block_q8_0 *) (src0_ptr2 + m1 * nb01);
+                                    float              s0, s1;
+                                    q8_dot_compute_x2_aligned(q_row0, q_row1, b_col_base, K_blocks, &s0, &s1);
+
+                                    float * dst0 = (float *) (dst_ptr2 + n * nbd1 + m0 * sizeof(float));
+                                    float * dst1 = (float *) (dst_ptr2 + n * nbd1 + m1 * sizeof(float));
+                                    if (bias_n) {
+                                        s0 += bias_n[m0];
+                                        s1 += bias_n[m1];
+                                    }
+                                    atomic_store_f32((volatile float *) dst0, s0);
+                                    atomic_store_f32((volatile float *) dst1, s1);
+                                } else {
+                                    float   sum = q8_dot_compute(q_row0, b_col_base, K_blocks);
+                                    float * dst = (float *) (dst_ptr2 + n * nbd1 + m0 * sizeof(float));
+                                    if (bias_n) {
+                                        sum += bias_n[m0];
+                                    }
+                                    atomic_store_f32((volatile float *) dst, sum);
+                                }
+                            }
+                        } else {
+                            for (int64_t m = hart_id; m < M; m += STRIDE_M) {
+                                const block_q8_0 * q_row = (const block_q8_0 *) (src0_ptr2 + m * nb01);
+
+                                float sum = q8_dot_compute(q_row, b_col_base, K_blocks);
+
+                                float * dst_entry = (float *) (dst_ptr2 + n * nbd1 + m * sizeof(float));
+                                if (bias_n) {
+                                    sum += bias_n[m];
+                                }
+                                atomic_store_f32((volatile float *) dst_entry, sum);
+                            }
+                        }
+
+                        q8_dot_end(&q8_state);
+                    }
                 }
             }
         }
