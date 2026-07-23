@@ -70,6 +70,15 @@ class Qwen2Model(TextModel):
         yield from super().modify_tensors(data_torch, name, bid)
 
 
+@ModelBase.register("SpatialLMQwenForCausalLM")
+class SpatialLMQwenModel(Qwen2Model):
+    model_arch = gguf.MODEL_ARCH.QWEN2
+    def modify_tensors(self, data_torch, name, bid):
+        if name.startswith("point_backbone.") or name.startswith("point_proj.") or name.startswith("point_"):
+            return
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
 @ModelBase.register("Qwen2MoeForCausalLM")
 class Qwen2MoeModel(TextModel):
     model_arch = gguf.MODEL_ARCH.QWEN2MOE

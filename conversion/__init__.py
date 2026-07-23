@@ -194,6 +194,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "Qwen2AudioForConditionalGeneration": "qwen",
     "Qwen2ForCausalLM": "qwen",
     "Qwen2Model": "qwen",
+    "SpatialLMQwenForCausalLM": "qwen",
     "Qwen2MoeForCausalLM": "qwen",
     "Qwen2VLForConditionalGeneration": "qwenvl",
     "Qwen2VLModel": "qwenvl",
