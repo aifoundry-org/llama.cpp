@@ -281,6 +281,11 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
         if (is_hart1) {
             scp_signal(ready_ctr, 0);
             scp_signal(consumed_ctr, 0);
+            // L2-SCP persists across kernel dispatches (only zeroed at boot) and the
+            // two harts have no implicit ordering at entry. Barrier so the consumer
+            // sees this reset before its first scp_wait, otherwise on a cold first
+            // dispatch it reads a stale counter and races ahead of the producer.
+            et_barrier(ET_BARRIER_MINION);
             uint32_t wid = 0;
 
             for (int64_t unit = my_start; unit < base_units; unit += tiles_stride) {
@@ -309,7 +314,7 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
                                            src0_batch, mb, kb0 + i, nb1_0);
                     }
                     FENCE;
-                    flush_to_l2(cache_buf[buf], kbn * BLOCK_K, 64);
+                    flush_to_l2_multi(cache_buf[buf], kbn * BLOCK_K, 64);
                     WAIT_CACHEOPS;
 
                     wid++;
@@ -326,6 +331,8 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
         ucache_control(1, REP_RATE, CACHEOP_MAX);
 #endif
         CLEAR_TENSOR_ERROR;
+        // Rendezvous with the producer so its counter reset is visible before we read.
+        et_barrier(ET_BARRIER_MINION);
         evict_to_l2((const void *) ready_ctr, 1, 64);    WAIT_CACHEOPS;
         evict_to_l2((const void *) consumed_ctr, 1, 64); WAIT_CACHEOPS;
 
@@ -426,6 +433,8 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
     if (is_hart1) {
         scp_signal(ready_ctr, 0);
         scp_signal(consumed_ctr, 0);
+        // See REUSE path: barrier so the consumer observes the reset before it reads.
+        et_barrier(ET_BARRIER_MINION);
         uint32_t chunk_id = 0;
 
         for (int64_t tile = my_start; tile < base_tiles; tile += tiles_stride) {
@@ -449,7 +458,7 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
                 dequant_q4_0_panel(scp_panel[buf], src0_batch, mb, kb, nb1_0);
 
                 FENCE;
-                flush_to_l2(scp_panel[buf], BLOCK_K, 64);
+                flush_to_l2_multi(scp_panel[buf], BLOCK_K, 64);
                 WAIT_CACHEOPS;
 
                 chunk_id++;
@@ -465,6 +474,8 @@ int entry_point(struct ggml_et_binary_params *params, void *env) {
     ucache_control(1, REP_RATE, CACHEOP_MAX);
 #endif
     CLEAR_TENSOR_ERROR;
+    // Rendezvous with the producer so its counter reset is visible before we read.
+    et_barrier(ET_BARRIER_MINION);
     evict_to_l2((const void *) ready_ctr, 1, 64);    WAIT_CACHEOPS;
     evict_to_l2((const void *) consumed_ctr, 1, 64); WAIT_CACHEOPS;
 
